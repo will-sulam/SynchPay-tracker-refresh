@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
 """
 refresh_synchpay_tracker.py
-
+ 
 Refreshes the SynchPay Master Client Communication Tracker (Google Sheet) from
 Attio CRM data. Written to run OUTSIDE the Cowork session, wherever you have:
-
+ 
   1. A Google service account (or OAuth client) with edit access to the sheet,
      and the Sheets API enabled on that Google Cloud project.
   2. An Attio API token. For full accuracy (see note 2 below) it needs read
      scopes for: Notes, Meetings, and — if you want email-derived touches too
      — Emails (Workspace settings -> Developers -> [integration] -> Scopes).
-
+ 
 -------------------------------------------------------------------------------
 SETUP
 -------------------------------------------------------------------------------
     pip install google-auth google-api-python-client requests
-
+ 
 Environment variables (or edit the CONFIG block below):
     GOOGLE_SERVICE_ACCOUNT_JSON   Path to a service-account JSON key file.
                                   The service account's email must be shared
                                   as an Editor on the spreadsheet.
     ATTIO_API_KEY                 Attio API token.
-
+ 
 Usage:
     python refresh_synchpay_tracker.py --dry-run     # preview only, no writes
     python refresh_synchpay_tracker.py                # apply the refresh
     python refresh_synchpay_tracker.py --diff-only    # print status changes,
                                                         # write nothing
-
+ 
 -------------------------------------------------------------------------------
 IMPORTANT — VERIFY BEFORE YOU RUN THIS FOR REAL
 -------------------------------------------------------------------------------
@@ -41,7 +41,7 @@ IMPORTANT — VERIFY BEFORE YOU RUN THIS FOR REAL
        O Pricing Details (from calls/CRM) | P Recordings Mined |
        Q Suggested Next Action | R Deal Type
    Re-run with --dry-run first if this ever changes.
-
+ 
 2. Where "real call/CRM activity" actually lives in this workspace (found by
    testing directly against the live API, not assumed):
      - Deal records themselves have ZERO notes attached. The rich,
@@ -70,7 +70,7 @@ IMPORTANT — VERIFY BEFORE YOU RUN THIS FOR REAL
    single most recent item across all three sources (by timestamp) always
    determines Days Quiet / Last Touch / Status. What determines the Deal
    Summary TEXT is note 2a below.
-
+ 
 2a. Multi-call narrative summaries (requires ANTHROPIC_API_KEY). Checking
     the actual note counts per deal while building this: 50 of the 73 deals
     have 2+ notes attached to their linked people/company — some have far
@@ -103,7 +103,7 @@ IMPORTANT — VERIFY BEFORE YOU RUN THIS FOR REAL
     for a handful of multi-note deals (the note-count leaders are the best
     stress test: CareCloud & FoxPT, Manhattan Dental Spa, Dentirate
     Partnership) before trusting it.
-
+ 
 2b. Plain-language requirement. Every synthesized summary is explicitly
     written for a high-school reading level: short sentences, one idea per
     sentence, no business/finance jargon (plain "money"/"fee"/"cost" instead
@@ -124,7 +124,7 @@ IMPORTANT — VERIFY BEFORE YOU RUN THIS FOR REAL
     ANTHROPIC_API_KEY is set. Same untested-against-a-live-key caveat as 2a
     applies to the plain-language wording itself — read the actual output
     before trusting that a high schooler would really follow it.
-
+ 
 3. Status thresholds. The legend on the Summary tab reads:
        OVERDUE              - no touch in a while, needs outreach today
        REACH OUT NOW         - inside 5-day check-in window
@@ -135,12 +135,12 @@ IMPORTANT — VERIFY BEFORE YOU RUN THIS FOR REAL
    documented anywhere retrievable, so STATUS_THRESHOLDS below is a
    best-effort default — tune it, or replace compute_status() with your real
    business rule. Sanity-check rows with --dry-run against your own judgment.
-
+ 
 4. Phone/Cell and Lead Temp are never written automatically (see
    UNTOUCHED_UNLESS_NEW_DATA) — task instructions were to leave them as-is
    unless real data was found, and this script has no verified source for
    either yet.
-
+ 
 5. Pricing Details protection. PROTECTED_PRICING lists the entries the task
    said never to touch unless new statement data justifies it: Dr. Volchonok
    / AV Periodontics, Clinton Street Dental, Dental World (verified/green —
@@ -149,15 +149,15 @@ IMPORTANT — VERIFY BEFORE YOU RUN THIS FOR REAL
    "statement"). classify_pricing_confidence() color-codes any *new* pricing
    text for non-protected rows — it's a keyword heuristic, not a certified
    classifier; review its output.
-
+ 
 6. This script does an authenticated, direct write. Always run --dry-run
    first, read the console output, and only then re-run without --dry-run.
-
+ 
 7. Rate limiting / retries. All Attio calls go through request_with_retry(),
    which backs off and retries on 429/502/503/504 — the live API returned a
    transient 502 mid-pagination during development, so this isn't optional.
 """
-
+ 
 import argparse
 import datetime as dt
 import json
@@ -166,24 +166,27 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
-
+ 
 import requests
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-
+# NOTE: google-auth / google-api-python-client are imported LAZILY, inside
+# get_sheets_service() only. The --emit-plan mode added for the scheduled
+# Cowork task (see note 8 below) never calls that function — it has no
+# Google credentials at all and doesn't need them, so it only needs
+# `requests` installed. Importing these at module load time would make
+# `pip install requests` insufficient for that mode.
+ 
 # =============================================================================
 # CONFIG - edit these to match your environment / sheet layout
 # =============================================================================
-
+ 
 SPREADSHEET_ID = "1BGJxRssifEtUV-opja1bzLv4bK6Y0HiaARVpVjo4cZs"  # "tracker_updated"
 DEALS_SHEET_NAME = "Deals"
 SUMMARY_SHEET_NAME = "Summary"
-
+ 
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json")
 ATTIO_API_KEY = os.environ.get("ATTIO_API_KEY", "")
 ATTIO_API_BASE = "https://api.attio.com/v2"
-
+ 
 # Optional: synthesizes a multi-call narrative "Deal Summary" instead of just
 # pasting the single most recent note verbatim (see note 2a below). Leave
 # ANTHROPIC_API_KEY unset to skip this and fall back to the old
@@ -196,9 +199,9 @@ MIN_NOTES_TO_SYNTHESIZE = 1   # any note at all gets run through the LLM — see
 MAX_NOTES_PER_SYNTHESIS = 12  # most-recent N notes fed to the model, to bound cost/latency
 MAX_CHARS_PER_NOTE = 1500     # truncate any single very long note before it goes in the prompt
 MAX_MEETINGS_LISTED = 8       # supplementary "other touchpoints" list, titles/dates only
-
+ 
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
+ 
 COLUMNS = {
     "deal": 0,
     "stage": 1,
@@ -220,7 +223,7 @@ COLUMNS = {
     "deal_type": 17,
 }
 NUM_COLS = len(COLUMNS)
-
+ 
 WRITABLE_FIELDS = {
     "days_quiet",
     "last_touch",
@@ -231,14 +234,14 @@ WRITABLE_FIELDS = {
     "recordings_mined",
     "suggested_next_action",
 }
-
+ 
 UNTOUCHED_UNLESS_NEW_DATA = {
     "phone_cell": COLUMNS["phone_cell"],
     "lead_temp": COLUMNS["lead_temp"],
 }
-
+ 
 PRICING_DETAILS_COL = COLUMNS["pricing_details"]
-
+ 
 PROTECTED_PRICING = {
     "verified": {
         "dr. volchonok", "volchonok", "av periodontics",
@@ -249,7 +252,7 @@ PROTECTED_PRICING = {
         "westchester oral surgery",
     },
 }
-
+ 
 STATUS_COLORS = {
     "OVERDUE":               {"bg": (0.957, 0.800, 0.800), "fg": (0.600, 0.000, 0.000)},  # red
     "REACH OUT NOW":         {"bg": (1.000, 0.949, 0.800), "fg": (0.600, 0.400, 0.000)},  # yellow
@@ -257,30 +260,30 @@ STATUS_COLORS = {
     "NO ACTIVITY ON RECORD": {"bg": (0.898, 0.898, 0.898), "fg": (0.400, 0.400, 0.400)},  # gray
     "Closed":                {"bg": (0.851, 0.878, 0.918), "fg": (0.200, 0.250, 0.400)},  # blue-gray
 }
-
+ 
 PRICING_CONFIDENCE_COLORS = {
     "verified": {"bg": (0.851, 0.918, 0.827)},       # green
     "raw_statement": {"bg": (1.000, 0.878, 0.702)},  # orange
     "call_mention": {"bg": (1.000, 0.949, 0.800)},   # yellow
 }
-
+ 
 STATUS_THRESHOLDS = {
     "reach_out_now_days": 5,
     "active_days": 10,
 }
-
+ 
 REQUEST_PAUSE_SECONDS = 0.15
 MAX_RETRIES = 5
 NOTES_PAGE_LIMIT = 50
 MEETINGS_PAGE_LIMIT = 50
 EMAILS_PAGE_LIMIT = 50
 SAFETY_MAX_PAGES = 500  # hard stop so a pagination bug can't loop forever
-
-
+ 
+ 
 # =============================================================================
 # Data classes
 # =============================================================================
-
+ 
 @dataclass
 class DealRow:
     row_index: int
@@ -289,25 +292,25 @@ class DealRow:
     company: str
     current: dict = field(default_factory=dict)
     refreshed: dict = field(default_factory=dict)
-
+ 
     def is_protected_verified(self) -> bool:
         haystack = f"{self.deal_name} {self.company}".lower()
         return any(term in haystack for term in PROTECTED_PRICING["verified"])
-
+ 
     def is_protected_needs_audit(self) -> bool:
         haystack = f"{self.deal_name} {self.company}".lower()
         return any(term in haystack for term in PROTECTED_PRICING["needs_audit_keep"])
-
+ 
     def contact_emails(self) -> list:
         raw = self.current.get("contact_email", "") or ""
         return [e.strip().lower() for e in re.split(r"[;,]", raw) if e.strip() and "@" in e]
-
-
+ 
+ 
 # =============================================================================
 # HTTP helper with retries (the live Attio API returned a transient 502
 # mid-pagination during development — don't skip this)
 # =============================================================================
-
+ 
 def request_with_retry(session: requests.Session, method: str, url: str, **kwargs) -> requests.Response:
     delay = 1.0
     last_exc = None
@@ -327,13 +330,19 @@ def request_with_retry(session: requests.Session, method: str, url: str, **kwarg
     if last_exc:
         raise last_exc
     return resp  # last response, even if it was a retryable status
-
-
+ 
+ 
 # =============================================================================
 # Google Sheets helpers
 # =============================================================================
-
+ 
 def get_sheets_service():
+    # Lazy import — see the note at the top of the file. Only the legacy
+    # --dry-run / real-write path (service-account auth) needs these
+    # packages; --emit-plan mode does not import this function at all.
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+ 
     if not os.path.exists(GOOGLE_SERVICE_ACCOUNT_JSON):
         sys.exit(
             f"ERROR: service account file not found at "
@@ -344,8 +353,8 @@ def get_sheets_service():
         GOOGLE_SERVICE_ACCOUNT_JSON, scopes=SHEETS_SCOPES
     )
     return build("sheets", "v4", credentials=creds)
-
-
+ 
+ 
 def get_sheet_id(service, sheet_name: str) -> int:
     meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
     for sheet in meta["sheets"]:
@@ -353,8 +362,8 @@ def get_sheet_id(service, sheet_name: str) -> int:
         if props["title"] == sheet_name:
             return props["sheetId"]
     sys.exit(f"ERROR: sheet tab {sheet_name!r} not found in spreadsheet.")
-
-
+ 
+ 
 def read_deals_tab(service) -> list:
     last_col_letter = _col_letter(NUM_COLS - 1)
     result = (
@@ -365,33 +374,33 @@ def read_deals_tab(service) -> list:
         .execute()
     )
     return result.get("values", [])
-
-
+ 
+ 
 def parse_deal_rows(grid: list) -> list:
     rows = []
     current_rep = None
     in_data_block = False
-
+ 
     for i, raw in enumerate(grid):
         row_num = i + 1
         first_cell = raw[0].strip() if raw else ""
-
+ 
         if not first_cell:
             in_data_block = False
             continue
-
+ 
         if re.search(r"\(\d+ deals\)\s*$", first_cell):
             current_rep = re.sub(r"\s*\(\d+ deals\)\s*$", "", first_cell).strip()
             in_data_block = False
             continue
-
+ 
         if first_cell == "Deal":
             in_data_block = True
             continue
-
+ 
         if first_cell.startswith("Deals —") or first_cell.startswith("SynchPay"):
             continue
-
+ 
         if in_data_block and current_rep:
             padded = raw + [""] * (NUM_COLS - len(raw))
             current = {name: padded[idx] for name, idx in COLUMNS.items()}
@@ -404,16 +413,16 @@ def parse_deal_rows(grid: list) -> list:
                     current=current,
                 )
             )
-
+ 
     return rows
-
-
+ 
+ 
 def build_value_update_requests(deal_rows: list) -> list:
     requests_batch = []
     for d in deal_rows:
         if not d.refreshed:
             continue
-
+ 
         for field_name in WRITABLE_FIELDS:
             if field_name not in d.refreshed:
                 continue
@@ -424,7 +433,7 @@ def build_value_update_requests(deal_rows: list) -> list:
                     "values": [[d.refreshed[field_name]]],
                 }
             )
-
+ 
         if "pricing_details" in d.refreshed:
             if d.is_protected_verified():
                 print(f"  [skip] {d.deal_name}: VERIFIED pricing is protected, not overwriting.")
@@ -438,10 +447,10 @@ def build_value_update_requests(deal_rows: list) -> list:
                         "values": [[d.refreshed["pricing_details"]]],
                     }
                 )
-
+ 
     return requests_batch
-
-
+ 
+ 
 def _col_letter(idx: int) -> str:
     letters = ""
     idx += 1
@@ -449,13 +458,13 @@ def _col_letter(idx: int) -> str:
         idx, rem = divmod(idx - 1, 26)
         letters = chr(65 + rem) + letters
     return letters
-
-
+ 
+ 
 def build_color_requests(deal_rows: list, sheet_id: int) -> list:
     requests_batch = []
     status_col = COLUMNS["status"]
     pricing_col = COLUMNS["pricing_details"]
-
+ 
     for d in deal_rows:
         new_status = d.refreshed.get("status")
         if new_status and new_status != d.current.get("status"):
@@ -465,7 +474,7 @@ def build_color_requests(deal_rows: list, sheet_id: int) -> list:
                 requests_batch.append(_repeat_cell_color_request(
                     sheet_id, d.row_index, status_col, colors["bg"], colors["fg"]
                 ))
-
+ 
         if "pricing_details" in d.refreshed and not d.is_protected_verified() \
                 and not (d.is_protected_needs_audit() and not d.refreshed.get("pricing_details_is_new_statement")):
             confidence = classify_pricing_confidence(d.refreshed["pricing_details"])
@@ -474,10 +483,10 @@ def build_color_requests(deal_rows: list, sheet_id: int) -> list:
                 requests_batch.append(_repeat_cell_color_request(
                     sheet_id, d.row_index, pricing_col, colors["bg"], None
                 ))
-
+ 
     return requests_batch
-
-
+ 
+ 
 def _repeat_cell_color_request(sheet_id, row_index, col_idx, bg_rgb, fg_rgb):
     cell_format = {"backgroundColor": {"red": bg_rgb[0], "green": bg_rgb[1], "blue": bg_rgb[2]}}
     fields = "userEnteredFormat.backgroundColor"
@@ -497,8 +506,8 @@ def _repeat_cell_color_request(sheet_id, row_index, col_idx, bg_rgb, fg_rgb):
             "fields": fields,
         }
     }
-
-
+ 
+ 
 def classify_pricing_confidence(text: str) -> str:
     t = (text or "").lower()
     if any(kw in t for kw in ("processor statement", "verified", "audited", "synchpay model")):
@@ -506,42 +515,61 @@ def classify_pricing_confidence(text: str) -> str:
     if any(kw in t for kw in ("statement on file", "raw statement")):
         return "raw_statement"
     return "call_mention"
-
-
+ 
+ 
 def apply_updates(service, deal_rows: list, sheet_id: int, dry_run: bool):
     value_updates = build_value_update_requests(deal_rows)
     color_updates = build_color_requests(deal_rows, sheet_id)
-
-    print(f"Prepared {len(value_updates)} cell value updates and "
+ 
+    # Summary tab counts are recomputed and written on every run now — this
+    # used to be a manual follow-up step (easy to forget on an unattended
+    # scheduled run, and it was in fact forgotten on the first real run of
+    # this script, leaving the Summary tab stale until caught and fixed by
+    # hand). counts_before comes straight from d.current (pre-refresh sheet
+    # values already in memory), so no extra API read is needed.
+    counts_before = build_summary_counts(deal_rows, use_refreshed=False)
+    counts_after = build_summary_counts(deal_rows, use_refreshed=True)
+    summary_updates = build_summary_value_plan(counts_after)
+    value_updates = value_updates + summary_updates
+ 
+    slack_message = build_slack_message(
+        deal_rows, counts_after, counts_before,
+        f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit",
+    )
+    print("\n--- Ready-to-post Slack summary ---")
+    print(slack_message)
+    print("--- end Slack summary ---\n")
+ 
+    print(f"Prepared {len(value_updates)} cell value updates (including Summary tab) and "
           f"{len(color_updates)} cell-color updates.")
-
+ 
     if dry_run:
         print("--dry-run set: no writes performed.")
         return
-
+ 
     if value_updates:
         body = {"valueInputOption": "USER_ENTERED", "data": value_updates}
         service.spreadsheets().values().batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body).execute()
         time.sleep(REQUEST_PAUSE_SECONDS)
-
+ 
     if color_updates:
         service.spreadsheets().batchUpdate(spreadsheetId=SPREADSHEET_ID, body={"requests": color_updates}).execute()
-
-    print("Sheet updated.")
-
-
+ 
+    print("Sheet updated (deal rows + Summary tab).")
+ 
+ 
 # =============================================================================
 # Attio: bulk fetch + indexing (fetched ONCE, not per-deal)
 # =============================================================================
-
+ 
 def attio_session() -> requests.Session:
     if not ATTIO_API_KEY:
         sys.exit("ERROR: ATTIO_API_KEY is not set.")
     s = requests.Session()
     s.headers.update({"Authorization": f"Bearer {ATTIO_API_KEY}", "Content-Type": "application/json"})
     return s
-
-
+ 
+ 
 def fetch_all_deals(session: requests.Session) -> list:
     deals = []
     offset = 0
@@ -557,8 +585,8 @@ def fetch_all_deals(session: requests.Session) -> list:
         offset += limit
         time.sleep(REQUEST_PAUSE_SECONDS)
     return deals
-
-
+ 
+ 
 def fetch_all_notes(session: requests.Session) -> dict:
     """Returns {(parent_object, parent_record_id): [note, ...]} for every note
     in the workspace, fetched once via offset pagination (max page size 50).
@@ -583,8 +611,8 @@ def fetch_all_notes(session: requests.Session) -> dict:
         time.sleep(REQUEST_PAUSE_SECONDS)
     print(f"Fetched {total} notes from Attio.")
     return index
-
-
+ 
+ 
 def fetch_all_meetings(session: requests.Session) -> dict:
     """Returns {"by_record": {(object_slug, record_id): [meeting,...]},
                 "by_email": {email_lower: [meeting,...]}}
@@ -618,8 +646,8 @@ def fetch_all_meetings(session: requests.Session) -> dict:
         time.sleep(REQUEST_PAUSE_SECONDS)
     print(f"Fetched {total} meetings from Attio.")
     return {"by_record": by_record, "by_email": by_email}
-
-
+ 
+ 
 def fetch_all_emails(session: requests.Session) -> dict:
     """Best-effort. Returns {"by_email": {email_lower: [email,...]}}, or an
     empty index (with a printed warning) if the API key doesn't have the
@@ -638,7 +666,7 @@ def fetch_all_emails(session: requests.Session) -> dict:
     if resp.status_code != 200:
         print(f"  WARNING: /emails returned {resp.status_code}; skipping email-derived touches.")
         return {"by_email": by_email}
-
+ 
     cursor = None
     total = 0
     first_page = resp.json()
@@ -655,7 +683,7 @@ def fetch_all_emails(session: requests.Session) -> dict:
         pages_data.append(body)
         cursor = body.get("pagination", {}).get("next_cursor")
         time.sleep(REQUEST_PAUSE_SECONDS)
-
+ 
     for body in pages_data:
         for email in body.get("data", []):
             total += 1
@@ -667,8 +695,8 @@ def fetch_all_emails(session: requests.Session) -> dict:
                     by_email.setdefault(addr, []).append(email)
     print(f"Fetched {total} emails from Attio.")
     return {"by_email": by_email}
-
-
+ 
+ 
 def get_related_parents(attio_deal: dict) -> list:
     """(object, record_id) pairs worth checking for a given deal: its
     associated people, consultant(s), associated company, and the deal
@@ -677,7 +705,7 @@ def get_related_parents(attio_deal: dict) -> list:
     free dict lookup now so there's no cost to still checking it)."""
     values = attio_deal.get("values", {}) or {}
     parents = []
-
+ 
     def _extract(entries):
         out = []
         if not entries:
@@ -692,14 +720,14 @@ def get_related_parents(attio_deal: dict) -> list:
             if obj and rid:
                 out.append((obj, rid))
         return out
-
+ 
     parents.extend(_extract(values.get("associated_people")))
     parents.extend(_extract(values.get("consultant")))
     parents.extend(_extract(values.get("associated_company")))
     deal_id = attio_deal.get("id", {}).get("record_id")
     if deal_id:
         parents.append(("deals", deal_id))
-
+ 
     seen = set()
     deduped = []
     for obj, rid in parents:
@@ -708,12 +736,12 @@ def get_related_parents(attio_deal: dict) -> list:
             seen.add(key)
             deduped.append(key)
     return deduped
-
-
+ 
+ 
 # =============================================================================
 # Refresh computation
 # =============================================================================
-
+ 
 def _parse_dt(raw: str):
     if not raw:
         return None
@@ -721,14 +749,14 @@ def _parse_dt(raw: str):
         return dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         return None
-
-
+ 
+ 
 def gather_activity_candidates(d: DealRow, attio_deal: dict, note_index: dict,
                                 meeting_index: dict, email_index: dict) -> list:
     """Returns a list of (datetime, source_type, text) candidates, newest
     first, pooling every note/meeting/email touch found across every record
     linked to this deal.
-
+ 
     BUG FOUND IN TESTING: "XPO Transitions" matched a meeting dated 2028 —
     two years in the future (a future-scheduled or mis-dated calendar entry
     picked up via a shared contact email). That produced a negative
@@ -739,7 +767,7 @@ def gather_activity_candidates(d: DealRow, attio_deal: dict, note_index: dict,
     now = dt.datetime.now(dt.timezone.utc)
     candidates = []
     seen_ids = set()
-
+ 
     for obj, rid in get_related_parents(attio_deal):
         for note in note_index.get((obj, rid), []):
             note_id = note.get("id", {}).get("note_id")
@@ -752,7 +780,7 @@ def gather_activity_candidates(d: DealRow, attio_deal: dict, note_index: dict,
             text = note.get("content_plaintext") or note.get("content_markdown") or ""
             title = note.get("title") or ""
             candidates.append((created, "note", f"{title}\n{text}".strip() if title else text))
-
+ 
         for mtg in meeting_index.get("by_record", {}).get((obj, rid), []):
             mtg_id = mtg.get("id", {}).get("meeting_id")
             if mtg_id in seen_ids:
@@ -765,7 +793,7 @@ def gather_activity_candidates(d: DealRow, attio_deal: dict, note_index: dict,
             desc = (mtg.get("description") or "").strip()
             text = f"Meeting: {title}" + (f" — {desc[:300]}" if desc else "")
             candidates.append((created, "meeting", text))
-
+ 
     for email_addr in d.contact_emails():
         for mtg in meeting_index.get("by_email", {}).get(email_addr, []):
             mtg_id = mtg.get("id", {}).get("meeting_id")
@@ -779,7 +807,7 @@ def gather_activity_candidates(d: DealRow, attio_deal: dict, note_index: dict,
             desc = (mtg.get("description") or "").strip()
             text = f"Meeting: {title}" + (f" — {desc[:300]}" if desc else "")
             candidates.append((created, "meeting", text))
-
+ 
         for eml in email_index.get("by_email", {}).get(email_addr, []):
             eml_id = eml.get("id", {}).get("email_id") if isinstance(eml.get("id"), dict) else eml.get("id")
             if eml_id in seen_ids:
@@ -792,14 +820,14 @@ def gather_activity_candidates(d: DealRow, attio_deal: dict, note_index: dict,
             snippet = (eml.get("snippet") or eml.get("summary") or "").strip()
             text = f"Email: {subject}" + (f" — {snippet[:300]}" if snippet else "")
             candidates.append((created, "email", text))
-
+ 
     candidates.sort(key=lambda c: c[0], reverse=True)
     return candidates
-
-
+ 
+ 
 _ANTHROPIC_WARNING_PRINTED = False
-
-
+ 
+ 
 def synthesize_multi_call_summary(deal_name: str, company: str, notes: list, meetings: list):
     """
     notes: list of (datetime, text) tuples, any order — internally sorted
@@ -817,7 +845,7 @@ def synthesize_multi_call_summary(deal_name: str, company: str, notes: list, mee
                   "note/meeting, verbatim, same as the previous version of this script.")
             _ANTHROPIC_WARNING_PRINTED = True
         return None
-
+ 
     notes_sorted = sorted(notes, key=lambda n: n[0])[-MAX_NOTES_PER_SYNTHESIS:]
     notes_block = "\n\n".join(
         f"[Call/note {i+1} — {ts.date().isoformat()}]\n{text[:MAX_CHARS_PER_NOTE]}"
@@ -825,13 +853,13 @@ def synthesize_multi_call_summary(deal_name: str, company: str, notes: list, mee
     )
     meetings_sorted = sorted(meetings, key=lambda m: m[0], reverse=True)[:MAX_MEETINGS_LISTED]
     meetings_block = "\n".join(f"- {ts.date().isoformat()}: {title}" for ts, title in meetings_sorted)
-
+ 
     prompt = f"""You are maintaining a sales CRM tracker. Below are call/meeting notes for one deal,
 oldest to newest. Write a "Deal Summary" covering who's involved, what's been discussed across the
 calls (in order if there's a progression — e.g. "First call covered X. Later, Y came up."),
 any pushback or concerns raised, and where things stand now. Be specific and factual — use real
 names and numbers from the notes, don't editorialize or invent anything not in the notes.
-
+ 
 WRITING LEVEL — this is the most important instruction: write it so a high school student with no
 business or finance background could read it and fully understand it on the first pass.
     - Short sentences. One idea per sentence.
@@ -843,22 +871,22 @@ business or finance background could read it and fully understand it on the firs
     - 2-4 sentences total. Say only what matters — don't pad it to sound more sophisticated.
     - Still be specific: keep real names, dollar amounts, and dates from the notes. "Simple" means
       easy words and short sentences, not vague or missing the actual facts.
-
+ 
 Also give a short "last_discussion_topic" (under 12 words, same plain-language rule) describing
 just the most recent call's main subject.
-
+ 
 Deal: {deal_name}
 Company: {company or "(not set)"}
-
+ 
 --- Notes (chronological) ---
 {notes_block or "(no notes)"}
-
+ 
 --- Other recent meetings on file (titles/dates only, no transcript) ---
 {meetings_block or "(none)"}
-
+ 
 Respond with ONLY a JSON object, no other text, in exactly this shape:
 {{"summary": "...", "last_discussion_topic": "..."}}"""
-
+ 
     session = requests.Session()
     session.headers.update({
         "x-api-key": ANTHROPIC_API_KEY,
@@ -870,7 +898,7 @@ Respond with ONLY a JSON object, no other text, in exactly this shape:
         "max_tokens": 500,
         "messages": [{"role": "user", "content": prompt}],
     }
-
+ 
     delay = 1.0
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -888,12 +916,12 @@ Respond with ONLY a JSON object, no other text, in exactly this shape:
         print(f"  WARNING: Anthropic API kept rate-limiting/erroring for {deal_name!r}; "
               f"falling back to verbatim summary for this deal.")
         return None
-
+ 
     if resp.status_code != 200:
         print(f"  WARNING: Anthropic API returned {resp.status_code} for {deal_name!r} "
               f"({resp.text[:200]!r}); falling back to verbatim summary for this deal.")
         return None
-
+ 
     try:
         content = resp.json()["content"][0]["text"]
         match = re.search(r"\{.*\}", content, re.DOTALL)
@@ -906,8 +934,31 @@ Respond with ONLY a JSON object, no other text, in exactly this shape:
         print(f"  WARNING: couldn't parse Anthropic response for {deal_name!r} ({exc}); "
               f"falling back to verbatim summary for this deal.")
         return None
-
-
+ 
+ 
+def extract_pricing_sentence(text: str):
+    """Per the build spec (Section 4): Pricing Details is whichever
+    sentence(s) of the Deal Summary contain a dollar sign or a percent sign
+    — not the whole summary. Notes are often bulleted/line-broken rather than
+    prose, so this splits on newlines first, then on sentence punctuation
+    within each line. Returns None if nothing in the text mentions $ or %."""
+    if not text:
+        return None
+    candidates = []
+    for line in text.replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        for sent in re.split(r"(?<=[.!?])\s+", line):
+            sent = sent.strip()
+            if sent:
+                candidates.append(sent)
+    matches = [s for s in candidates if ("$" in s) or ("%" in s)]
+    if not matches:
+        return None
+    return " ".join(matches)
+ 
+ 
 def compute_status(days_quiet, stage: str) -> str:
     stage_lower = (stage or "").lower()
     if stage_lower.startswith("won") or stage_lower == "lost":
@@ -919,34 +970,34 @@ def compute_status(days_quiet, stage: str) -> str:
     if days_quiet <= STATUS_THRESHOLDS["active_days"]:
         return "ACTIVE"
     return f"OVERDUE ({days_quiet}d)"
-
-
+ 
+ 
 def refresh_deal_row(d: DealRow, attio_deal: dict, note_index: dict,
                       meeting_index: dict, email_index: dict):
     stage = attio_deal.get("values", {}).get("stage", [{}])[0].get("status", {}).get("title", "")
     candidates = gather_activity_candidates(d, attio_deal, note_index, meeting_index, email_index)
-
+ 
     days_quiet = None
     last_touch_date = ""
     if candidates:
         newest_dt, _, _ = candidates[0]
         days_quiet = (dt.datetime.now(dt.timezone.utc) - newest_dt).days
         last_touch_date = newest_dt.date().isoformat()
-
+ 
     status = compute_status(days_quiet, stage)
-
+ 
     d.refreshed["days_quiet"] = str(days_quiet) if days_quiet is not None else "—"
     d.refreshed["last_touch"] = last_touch_date or "—"
     d.refreshed["last_activity_date"] = last_touch_date or "No record"
     d.refreshed["status"] = status
-
+ 
     if candidates:
         all_notes = [(ts, text) for ts, kind, text in candidates if kind == "note"]
         all_meetings = [(ts, text) for ts, kind, text in candidates if kind == "meeting"]
-
+ 
         summary_text = None
         topic_text = None
-
+ 
         if len(all_notes) >= MIN_NOTES_TO_SYNTHESIZE or all_meetings:
             # Runs the plain-language pass whenever there's at least one note,
             # OR (meetings-only deals) at least one meeting — calendar/Zoom/
@@ -957,7 +1008,7 @@ def refresh_deal_row(d: DealRow, attio_deal: dict, note_index: dict,
             if synthesized:
                 summary_text = synthesized["summary"]
                 topic_text = synthesized["last_discussion_topic"] or None
-
+ 
         if summary_text is None:
             # Nothing to synthesize, or the LLM call failed/was skipped
             # (no ANTHROPIC_API_KEY): fall back to the single richest recent
@@ -968,7 +1019,7 @@ def refresh_deal_row(d: DealRow, attio_deal: dict, note_index: dict,
             chosen = best_note or window[0]
             _, _, summary_text = chosen
             summary_text = summary_text[:600]
-
+ 
         d.refreshed["deal_summary"] = summary_text[:600]
         if topic_text:
             d.refreshed["last_discussion_topic"] = topic_text
@@ -980,17 +1031,24 @@ def refresh_deal_row(d: DealRow, attio_deal: dict, note_index: dict,
             else "Closed — no action needed"
         )
         d.refreshed["recordings_mined"] = str(len(all_notes))
-
-        if re.search(r"\b(rate|pricing|fee|surcharge|%|statement|volume)\b", summary_text, re.IGNORECASE):
-            d.refreshed["pricing_details"] = summary_text[:600]
+ 
+        # Pricing Details rule (per the build spec): scan the Deal Summary for
+        # any SENTENCE containing a $ or % — that sentence (not the whole
+        # summary) becomes the Pricing Details entry. If more than one
+        # sentence qualifies, all of them are kept (joined), since dropping
+        # a second dollar figure would lose real information the spec didn't
+        # anticipate needing to choose between.
+        pricing_sentence = extract_pricing_sentence(summary_text)
+        if pricing_sentence:
+            d.refreshed["pricing_details"] = pricing_sentence[:600]
             d.refreshed["pricing_details_is_new_statement"] = bool(
-                re.search(r"\bstatement\b", summary_text, re.IGNORECASE)
+                re.search(r"\bstatement\b", pricing_sentence, re.IGNORECASE)
             )
     # No candidates found at all -> leave deal_summary / suggested_next_action
     # / pricing_details / recordings_mined out of d.refreshed so the existing
     # text is preserved rather than blanked out.
-
-
+ 
+ 
 def match_attio_deal(d: DealRow, attio_deals: list):
     name_lower = d.deal_name.strip().lower()
     for rec in attio_deals:
@@ -998,12 +1056,148 @@ def match_attio_deal(d: DealRow, attio_deals: list):
         if rec_name.strip().lower() == name_lower:
             return rec
     return None
-
-
+ 
+ 
+# =============================================================================
+# Plan mode — for the scheduled Cowork task (note 8)
+# =============================================================================
+#
+# Everything below builds a JSON "plan" instead of writing to Sheets directly.
+# It's used when a Cowork agent session — not this script — holds the actual
+# Google credentials (via the connected Sheets connector) and applies the
+# writes itself. This script's job in that flow is just the part it's good
+# at: pulling Attio data and computing the refresh, fast and deterministically,
+# the same tested logic as the direct-write path above. See README.md for the
+# full flow this is designed to be called from.
+ 
+SUMMARY_BUCKET_ORDER = ["Overdue", "Reach Out Now", "Active", "No Activity on Record", "Closed", "RealSummary"]
+SUMMARY_ROWS = {"Seth Gollin": 5, "Charles Lehman": 6, "Ronnie Klein": 7}  # TOTAL is row 8
+SUMMARY_TOTAL_ROW = 8
+ 
+ 
+def status_bucket(status: str) -> str:
+    status = status or ""
+    if status.startswith("OVERDUE"):
+        return "Overdue"
+    if status == "REACH OUT NOW":
+        return "Reach Out Now"
+    if status == "ACTIVE":
+        return "Active"
+    if status == "NO ACTIVITY ON RECORD":
+        return "No Activity on Record"
+    if status == "Closed":
+        return "Closed"
+    return status
+ 
+ 
+def build_summary_counts(deal_rows: list, use_refreshed: bool) -> dict:
+    """Returns {rep_name_or_'TOTAL': {bucket: count}}. use_refreshed=True computes
+    the post-refresh counts; False computes the pre-refresh (current sheet) counts,
+    for the before/after comparison in the Slack message."""
+    from collections import Counter
+    by_rep = {}
+    for d in deal_rows:
+        status = d.refreshed.get("status") if use_refreshed and d.refreshed.get("status") else d.current.get("status", "")
+        recordings_raw = d.refreshed.get("recordings_mined") if use_refreshed and "recordings_mined" in d.refreshed else d.current.get("recordings_mined", "0")
+        try:
+            recordings = int(recordings_raw or "0")
+        except ValueError:
+            recordings = 0
+        c = by_rep.setdefault(d.rep, Counter())
+        c[status_bucket(status)] += 1
+        if recordings > 0:
+            c["RealSummary"] += 1
+    total = Counter()
+    for c in by_rep.values():
+        total.update(c)
+    by_rep["TOTAL"] = total
+    return by_rep
+ 
+ 
+def build_row_value_plan(deal_rows: list) -> list:
+    """One full-row values.update per changed row (all 18 columns, merging
+    refreshed fields over current ones) — far fewer API calls than one per
+    changed cell, and each write is a complete, self-contained row so a
+    partial-run failure can't leave a half-updated row."""
+    plan = []
+    field_order = sorted(COLUMNS, key=lambda k: COLUMNS[k])
+    for d in deal_rows:
+        if not d.refreshed:
+            continue
+        row_values = []
+        for field_name in field_order:
+            if field_name == "pricing_details":
+                if "pricing_details" in d.refreshed and not d.is_protected_verified() and not (
+                    d.is_protected_needs_audit() and not d.refreshed.get("pricing_details_is_new_statement")
+                ):
+                    row_values.append(d.refreshed["pricing_details"])
+                else:
+                    row_values.append(d.current.get("pricing_details", ""))
+            elif field_name in UNTOUCHED_UNLESS_NEW_DATA:
+                row_values.append(d.current.get(field_name, ""))
+            else:
+                row_values.append(d.refreshed.get(field_name, d.current.get(field_name, "")))
+        last_col = _col_letter(len(field_order) - 1)
+        plan.append({
+            "range": f"'{DEALS_SHEET_NAME}'!A{d.row_index}:{last_col}{d.row_index}",
+            "values": [row_values],
+        })
+    return plan
+ 
+ 
+def build_summary_value_plan(summary_counts: dict) -> list:
+    plan = []
+    for rep, row_num in SUMMARY_ROWS.items():
+        c = summary_counts.get(rep, {})
+        values = [c.get(k, 0) for k in SUMMARY_BUCKET_ORDER]
+        plan.append({"range": f"'{SUMMARY_SHEET_NAME}'!C{row_num}:H{row_num}", "values": [values]})
+    total = summary_counts.get("TOTAL", {})
+    total_values = [total.get(k, 0) for k in SUMMARY_BUCKET_ORDER]
+    plan.append({"range": f"'{SUMMARY_SHEET_NAME}'!C{SUMMARY_TOTAL_ROW}:H{SUMMARY_TOTAL_ROW}", "values": [total_values]})
+    return plan
+ 
+ 
+def build_slack_message(deal_rows: list, counts_after: dict, counts_before: dict, spreadsheet_url: str) -> str:
+    after = counts_after.get("TOTAL", {})
+    before = counts_before.get("TOTAL", {})
+ 
+    def line(label, key):
+        a, b = after.get(key, 0), before.get(key, 0)
+        delta = f" (was {b})" if b != a else ""
+        return f"• {label}: {a}{delta}"
+ 
+    changed = [d for d in deal_rows if d.refreshed.get("status") not in (None, d.current.get("status"))]
+    rep_lines = []
+    for rep in ("Seth Gollin", "Charles Lehman", "Ronnie Klein"):
+        c = counts_after.get(rep, {})
+        rep_lines.append(
+            f"• {rep} — {c.get('Overdue', 0)} overdue, {c.get('Reach Out Now', 0)} reach-out-now, "
+            f"{c.get('No Activity on Record', 0)} no-activity, {c.get('Closed', 0)} closed"
+        )
+ 
+    total_deals = sum(counts_after.get(rep, {}).get("Overdue", 0) + counts_after.get(rep, {}).get("Reach Out Now", 0)
+                       + counts_after.get(rep, {}).get("Active", 0) + counts_after.get(rep, {}).get("No Activity on Record", 0)
+                       + counts_after.get(rep, {}).get("Closed", 0)
+                       for rep in ("Seth Gollin", "Charles Lehman", "Ronnie Klein"))
+ 
+    return (
+        f"*SynchPay Master Tracker — refreshed*\n\n"
+        f"*Current state — {total_deals} deals total:*\n"
+        f"{line('Overdue', 'Overdue')}\n"
+        f"{line('Reach Out Now', 'Reach Out Now')}\n"
+        f"{line('Active', 'Active')}\n"
+        f"{line('No activity on record', 'No Activity on Record')}\n"
+        f"{line('Closed', 'Closed')}\n\n"
+        f"*By rep:*\n" + "\n".join(rep_lines) + "\n\n"
+        f"{len(changed)} deals changed status this run.\n\n"
+        f"Tracker: {spreadsheet_url}"
+    )
+ 
+ 
 # =============================================================================
 # Main
 # =============================================================================
-
+ 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true",
@@ -1011,21 +1205,21 @@ def main():
     parser.add_argument("--diff-only", action="store_true",
                          help="Print rows whose status would change, then exit without writing.")
     args = parser.parse_args()
-
+ 
     sheets = get_sheets_service()
     sheet_id = get_sheet_id(sheets, DEALS_SHEET_NAME)
     grid = read_deals_tab(sheets)
     deal_rows = parse_deal_rows(grid)
     print(f"Read {len(deal_rows)} deal rows from the '{DEALS_SHEET_NAME}' tab of spreadsheet {SPREADSHEET_ID}.")
-
+ 
     session = attio_session()
     attio_deals = fetch_all_deals(session)
     print(f"Fetched {len(attio_deals)} deal records from Attio.")
-
+ 
     note_index = fetch_all_notes(session)
     meeting_index = fetch_all_meetings(session)
     email_index = fetch_all_emails(session)
-
+ 
     unmatched = []
     for d in deal_rows:
         rec = match_attio_deal(d, attio_deals)
@@ -1033,28 +1227,29 @@ def main():
             unmatched.append(d.deal_name)
             continue
         refresh_deal_row(d, rec, note_index, meeting_index, email_index)
-
+ 
     if unmatched:
         print(f"\nWARNING: {len(unmatched)} sheet rows had no matching Attio deal by name and were left untouched:")
         for name in unmatched:
             print(f"  - {name}")
-
+ 
     changed = [d for d in deal_rows if d.refreshed.get("status") not in (None, d.current.get("status"))]
     print(f"\n{len(changed)} rows have a status change:")
     for d in changed:
         print(f"  [{d.rep}] {d.deal_name}: {d.current.get('status')!r} -> {d.refreshed.get('status')!r}")
-
+ 
     protected_skipped = [d for d in deal_rows if "pricing_details" in d.refreshed and d.is_protected_verified()]
     if protected_skipped:
         print(f"\n{len(protected_skipped)} rows had new pricing text detected but were PROTECTED (verified) and left untouched:")
         for d in protected_skipped:
             print(f"  - {d.deal_name}")
-
+ 
     if args.diff_only:
         return
-
+ 
     apply_updates(sheets, deal_rows, sheet_id, dry_run=args.dry_run)
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
+ 
